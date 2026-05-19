@@ -109,6 +109,7 @@ class KernelBuilder:
         inp_values_p = forest_values_p + n_nodes + batch_size
         cache_depth3 = variant.get("cache_depth3_onehot", True)
         cache_depth3_start_group = variant.get("cache_depth3_start_group", 14)
+        path_indices = variant.get("path_indices", True)
 
         def emit_packed(engine, slots):
             limit = SLOT_LIMITS[engine]
@@ -152,6 +153,11 @@ class KernelBuilder:
         vforest = vector_const(forest_values_p, "vforest_values_p")
         top_cache_nodes = 15 if cache_depth3 else 7
         vector_const(2)
+        if path_indices:
+            vec_consts[0] = vzero
+            vector_const(3)
+            for depth in range(3, forest_height + 1):
+                vector_const(forest_values_p + (1 << depth) - 1)
         for node_idx in range(4, top_cache_nodes):
             vector_const(node_idx)
         for op1, val1, op2, op3, val3 in HASH_STAGES:
@@ -181,7 +187,11 @@ class KernelBuilder:
         emit_packed("load", top_node_load_slots)
         emit_packed(
             "valu",
-            [("vbroadcast", addr, scalar_consts[val]) for val, addr in vec_consts.items()]
+            [
+                ("vbroadcast", addr, scalar_consts[val])
+                for val, addr in vec_consts.items()
+                if val in scalar_consts
+            ]
             + top_node_broadcast_slots,
         )
         nodes = []
@@ -258,10 +268,10 @@ class KernelBuilder:
         # groups and scalar ALU slots work on the tail lanes in parallel.
         scalar_hash_start_group = variant.get("scalar_hash_start_group", 26)
         scalar_gather_start_group = variant.get(
-            "scalar_gather_start_group", 28
+            "scalar_gather_start_group", 20
         )
         scalar_index_start_group = variant.get(
-            "scalar_index_start_group", 18
+            "scalar_index_start_group", 19
         )
         scalar_hash_start_by_stage = variant.get(
             "scalar_hash_start_by_stage", {1: 28, 3: 25, 5: 25}
@@ -298,7 +308,12 @@ class KernelBuilder:
                     set_component("select")
                     cond = add_node(
                         "valu",
-                        ("==", tmp1 + base, idxs + base, vec_consts[2]),
+                        (
+                            "==",
+                            tmp1 + base,
+                            idxs + base,
+                            vec_consts[1] if path_indices else vec_consts[2],
+                        ),
                         deps,
                     )
                     selected = add_node(
@@ -329,9 +344,10 @@ class KernelBuilder:
                         deps,
                     )
                     for node_idx in range(4, 7):
+                        compare_val = node_idx - 3 if path_indices else node_idx
                         cond = add_node(
                             "valu",
-                            ("==", tmp1 + base, idxs + base, vec_consts[node_idx]),
+                            ("==", tmp1 + base, idxs + base, vec_consts[compare_val]),
                             as_deps(idx_ready[g]) + [selected],
                         )
                         selected = add_node(
@@ -368,9 +384,10 @@ class KernelBuilder:
                         deps,
                     )
                     for node_idx in range(7, 15):
+                        compare_val = node_idx - 7 if path_indices else node_idx
                         cond = add_node(
                             "valu",
-                            ("==", tmp1 + base, idxs + base, vec_consts[node_idx]),
+                            ("==", tmp1 + base, idxs + base, vec_consts[compare_val]),
                             as_deps(idx_ready[g]) + [selected],
                         )
                         selected = add_node(
@@ -400,6 +417,12 @@ class KernelBuilder:
                             as_deps(value_ready[g]) + [selected],
                         )
                 else:
+                    addr_const = (
+                        forest_values_p + (1 << depth) - 1
+                        if path_indices
+                        else forest_values_p
+                    )
+                    vaddr_const = vec_consts[addr_const] if path_indices else vforest
                     if g >= scalar_gather_start_group:
                         addr_ready = [
                             add_node(
@@ -408,7 +431,7 @@ class KernelBuilder:
                                     "+",
                                     tmp1 + base + lane,
                                     idxs + base + lane,
-                                    scalar_consts[forest_values_p],
+                                    scalar_consts[addr_const],
                                 ),
                                 deps,
                             )
@@ -417,7 +440,7 @@ class KernelBuilder:
                     else:
                         addr_ready = add_node(
                             "valu",
-                            ("+", tmp1 + base, idxs + base, vforest),
+                            ("+", tmp1 + base, idxs + base, vaddr_const),
                             deps,
                         )
                     loads = [
@@ -442,7 +465,8 @@ class KernelBuilder:
                 cur_deps = as_deps(cur)
 
                 set_component("hash")
-                for hash_stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                def add_hash_stage(hash_stage, stage_deps):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hash_stage]
                     if op1 == "+" and op2 == "+" and op3 == "<<":
                         if g >= scalar_muladd_hash_start_group:
                             next_deps = []
@@ -469,21 +493,20 @@ class KernelBuilder:
                                         mul,
                                     )
                                 )
-                            cur_deps = next_deps
-                        else:
-                            cur = add_node(
-                                "valu",
-                                (
-                                    "multiply_add",
-                                    vals + base,
-                                    vals + base,
-                                    vec_consts[(1 << val3) + 1],
-                                    vec_consts[val1],
-                                ),
-                                cur_deps,
-                            )
-                            cur_deps = [cur]
-                    elif g >= scalar_hash_start_by_stage.get(
+                            return next_deps
+                        cur = add_node(
+                            "valu",
+                            (
+                                "multiply_add",
+                                vals + base,
+                                vals + base,
+                                vec_consts[(1 << val3) + 1],
+                                vec_consts[val1],
+                            ),
+                            stage_deps,
+                        )
+                        return [cur]
+                    if g >= scalar_hash_start_by_stage.get(
                         hash_stage, scalar_hash_start_group
                     ):
                         next_deps = []
@@ -491,12 +514,12 @@ class KernelBuilder:
                             h1 = add_node(
                                 "alu",
                                 (op1, tmp1 + base + lane, vals + base + lane, scalar_consts[val1]),
-                                cur_deps,
+                                stage_deps,
                             )
                             h2 = add_node(
                                 "alu",
                                 (op3, tmp2 + base + lane, vals + base + lane, scalar_consts[val3]),
-                                cur_deps,
+                                stage_deps,
                             )
                             next_deps.append(
                                 add_node(
@@ -510,27 +533,28 @@ class KernelBuilder:
                                     [h1, h2],
                                 )
                             )
-                        cur_deps = next_deps
-                    else:
-                        h1 = add_node(
-                            "valu",
-                            (op1, tmp1 + base, vals + base, vec_consts[val1]),
-                            cur_deps,
-                        )
-                        h2 = add_node(
-                            "valu",
-                            (op3, tmp2 + base, vals + base, vec_consts[val3]),
-                            cur_deps,
-                        )
-                        cur = add_node(
-                            "valu",
-                            (op2, vals + base, tmp1 + base, tmp2 + base),
-                            [h1, h2],
-                        )
-                        cur_deps = [cur]
+                        return next_deps
+                    h1 = add_node(
+                        "valu",
+                        (op1, tmp1 + base, vals + base, vec_consts[val1]),
+                        stage_deps,
+                    )
+                    h2 = add_node(
+                        "valu",
+                        (op3, tmp2 + base, vals + base, vec_consts[val3]),
+                        stage_deps,
+                    )
+                    cur = add_node(
+                        "valu",
+                        (op2, vals + base, tmp1 + base, tmp2 + base),
+                        [h1, h2],
+                    )
+                    return [cur]
+
+                for hash_stage in range(len(HASH_STAGES)):
+                    cur_deps = add_hash_stage(hash_stage, cur_deps)
 
                 value_ready[g] = cur_deps
-
                 if round_i == rounds - 1:
                     continue
 
@@ -544,30 +568,46 @@ class KernelBuilder:
                     if g >= scalar_index_start_group:
                         next_idx = []
                         for lane in range(VLEN):
-                            parity = add_node(
-                                "alu",
-                                ("&", tmp1 + base + lane, vals + base + lane, one),
-                                cur_deps,
-                            )
-                            next_idx.append(
-                                add_node(
-                                    "alu",
-                                    ("+", idxs + base + lane, tmp1 + base + lane, one),
-                                    parity,
+                            if path_indices:
+                                next_idx.append(
+                                    add_node(
+                                        "alu",
+                                        ("&", idxs + base + lane, vals + base + lane, one),
+                                        cur_deps,
+                                    )
                                 )
-                            )
+                            else:
+                                parity = add_node(
+                                    "alu",
+                                    ("&", tmp1 + base + lane, vals + base + lane, one),
+                                    cur_deps,
+                                )
+                                next_idx.append(
+                                    add_node(
+                                        "alu",
+                                        ("+", idxs + base + lane, tmp1 + base + lane, one),
+                                        parity,
+                                    )
+                                )
                         idx_ready[g] = next_idx
                     else:
-                        parity = add_node(
-                            "valu",
-                            ("&", tmp1 + base, vals + base, vone),
-                            cur_deps,
-                        )
-                        idx_ready[g] = add_node(
-                            "valu",
-                            ("+", idxs + base, tmp1 + base, vone),
-                            parity,
-                        )
+                        if path_indices:
+                            idx_ready[g] = add_node(
+                                "valu",
+                                ("&", idxs + base, vals + base, vone),
+                                cur_deps,
+                            )
+                        else:
+                            parity = add_node(
+                                "valu",
+                                ("&", tmp1 + base, vals + base, vone),
+                                cur_deps,
+                            )
+                            idx_ready[g] = add_node(
+                                "valu",
+                                ("+", idxs + base, tmp1 + base, vone),
+                                parity,
+                            )
                     continue
 
                 # Other depths use idx = 2 * idx + 1 + (val & 1).
@@ -584,23 +624,37 @@ class KernelBuilder:
                             ("<<", tmp2 + base + lane, idxs + base + lane, one),
                             cur_deps + as_deps(idx_ready[g]),
                         )
-                        child = add_node(
-                            "alu",
-                            ("+", tmp1 + base + lane, tmp1 + base + lane, one),
-                            parity,
-                        )
-                        next_idx.append(
-                            add_node(
-                                "alu",
-                                (
-                                    "+",
-                                    idxs + base + lane,
-                                    tmp2 + base + lane,
-                                    tmp1 + base + lane,
-                                ),
-                                [doubled, child],
+                        if path_indices:
+                            next_idx.append(
+                                add_node(
+                                    "alu",
+                                    (
+                                        "+",
+                                        idxs + base + lane,
+                                        tmp2 + base + lane,
+                                        tmp1 + base + lane,
+                                    ),
+                                    [doubled, parity],
+                                )
                             )
-                        )
+                        else:
+                            child = add_node(
+                                "alu",
+                                ("+", tmp1 + base + lane, tmp1 + base + lane, one),
+                                parity,
+                            )
+                            next_idx.append(
+                                add_node(
+                                    "alu",
+                                    (
+                                        "+",
+                                        idxs + base + lane,
+                                        tmp2 + base + lane,
+                                        tmp1 + base + lane,
+                                    ),
+                                    [doubled, child],
+                                )
+                            )
                     idx_ready[g] = next_idx
                 else:
                     parity = add_node(
@@ -608,16 +662,23 @@ class KernelBuilder:
                         ("&", tmp1 + base, vals + base, vone),
                         cur_deps,
                     )
-                    child = add_node(
-                        "valu",
-                        ("+", tmp1 + base, tmp1 + base, vone),
-                        parity,
-                    )
-                    idx_ready[g] = add_node(
-                        "valu",
-                        ("multiply_add", idxs + base, idxs + base, vec_consts[2], tmp1 + base),
-                        as_deps(idx_ready[g]) + [child],
-                    )
+                    if path_indices:
+                        idx_ready[g] = add_node(
+                            "valu",
+                            ("multiply_add", idxs + base, idxs + base, vec_consts[2], tmp1 + base),
+                            as_deps(idx_ready[g]) + [parity],
+                        )
+                    else:
+                        child = add_node(
+                            "valu",
+                            ("+", tmp1 + base, tmp1 + base, vone),
+                            parity,
+                        )
+                        idx_ready[g] = add_node(
+                            "valu",
+                            ("multiply_add", idxs + base, idxs + base, vec_consts[2], tmp1 + base),
+                            as_deps(idx_ready[g]) + [child],
+                        )
 
         set_component("store")
         for g in range(n_vecs):
