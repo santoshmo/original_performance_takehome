@@ -423,6 +423,7 @@ class KernelBuilder:
         scalar_gather_start_group = variant.get(
             "scalar_gather_start_group", 24
         )
+        scatter_vector_xor_depths = set(variant.get("scatter_vector_xor_depths", ()))
         compress_tmp2_lifetimes = variant.get("compress_tmp2_lifetimes", False)
 
         def emit_packed(engine, slots):
@@ -491,13 +492,36 @@ class KernelBuilder:
         top_node_load_slots = []
         top_node_broadcast_slots = []
         top_node_vecs = {}
+        top_node_scalars = self.alloc_scratch("top_node_scalars", top_cache_nodes)
+        # Shallow tree nodes are contiguous in memory, so cache them with wide
+        # loads before broadcasting each node into a lane-uniform vec.
+        if top_cache_nodes > VLEN:
+            top_node_load_slots.append(
+                ("vload", top_node_scalars, scalar_const(forest_values_p))
+            )
+            last_start = top_cache_nodes - VLEN
+            top_node_load_slots.append(
+                (
+                    "vload",
+                    top_node_scalars + last_start,
+                    scalar_const(forest_values_p + last_start),
+                )
+            )
+        elif top_cache_nodes == VLEN:
+            top_node_load_slots.append(
+                ("vload", top_node_scalars, scalar_const(forest_values_p))
+            )
+        else:
+            top_node_load_slots.extend(
+                ("load_offset", top_node_scalars, scalar_const(forest_values_p), lane)
+                for lane in range(top_cache_nodes)
+            )
         for node_idx in range(top_cache_nodes):
-            node_addr = scalar_const(forest_values_p + node_idx, f"top_node_addr_{node_idx}")
-            node_scalar = self.alloc_scratch(f"top_node_{node_idx}")
             node_vec = self.alloc_scratch(f"vtop_node_{node_idx}", VLEN)
             top_node_vecs[node_idx] = node_vec
-            top_node_load_slots.append(("load", node_scalar, node_addr))
-            top_node_broadcast_slots.append(("vbroadcast", node_vec, node_scalar))
+            top_node_broadcast_slots.append(
+                ("vbroadcast", node_vec, top_node_scalars + node_idx)
+            )
 
         # Diffs for the depth-3 tree mux (node_2k - node_(2k-1) for k=4..7).
         d3_diff_vecs = {}
@@ -1699,7 +1723,13 @@ class KernelBuilder:
                         for lane in range(VLEN)
                     ]
                     loaded_node = tmp1 + base if gather_into_addr_tmp else node_tmp
-                    if g >= scalar_gather_start_group:
+                    if g >= scalar_gather_start_group and depth in scatter_vector_xor_depths:
+                        cur = add_node(
+                            "valu",
+                            ("^", vals + base, vals + base, loaded_node),
+                            loads + as_deps(value_ready[g]),
+                        )
+                    elif g >= scalar_gather_start_group:
                         cur = [
                             add_node(
                                 "alu",
