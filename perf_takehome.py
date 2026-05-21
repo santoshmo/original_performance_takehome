@@ -44,6 +44,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.schedule_trace = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -89,89 +90,277 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Blog-layout SIMD/VLIW kernel built from the baseline repo:
+        path-offset state, one hash temp, dedicated node/select temps, and
+        cached depth-3 tree selection.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+        assert batch_size % VLEN == 0
+        n_vecs = batch_size // VLEN
+        forest_values_p = 7
+        inp_values_p = forest_values_p + n_nodes + batch_size
+
+        nodes = []
+        ready_by_engine = {engine: [] for engine in SLOT_LIMITS}
+        component = ["setup"]
+
+        def set_component(name):
+            component[0] = name
+
+        def deps_list(deps):
+            if deps is None:
+                return []
+            if isinstance(deps, int):
+                return [deps]
+            return list(deps)
+
+        def add_node(engine, slot, deps=None):
+            deps = deps_list(deps)
+            node_id = len(nodes)
+            nodes.append({
+                "engine": engine,
+                "slot": slot,
+                "component": component[0],
+                "deps_left": len(deps),
+                "succs": [],
+            })
+            for dep in deps:
+                nodes[dep]["succs"].append(node_id)
+            if not deps:
+                ready_by_engine[engine].append(node_id)
+            return node_id
+
+        def emit_packed(engine, slots):
+            for i in range(0, len(slots), SLOT_LIMITS[engine]):
+                self.instrs.append({engine: slots[i : i + SLOT_LIMITS[engine]]})
+
+        def schedule_nodes():
+            remaining = len(nodes)
+            while remaining:
+                instr = {}
+                chosen = []
+                for engine in ("load", "valu", "alu", "store", "flow"):
+                    ready = ready_by_engine[engine]
+                    if ready:
+                        take = ready[: SLOT_LIMITS[engine]]
+                        del ready[: SLOT_LIMITS[engine]]
+                        instr[engine] = [nodes[n]["slot"] for n in take]
+                        chosen.extend(take)
+                assert chosen, "scheduler stalled"
+                self.instrs.append(instr)
+                self.schedule_trace.append([
+                    (nodes[n]["component"], nodes[n]["engine"], nodes[n]["slot"])
+                    for n in chosen
+                ])
+                remaining -= len(chosen)
+                for node_id in chosen:
+                    for succ in nodes[node_id]["succs"]:
+                        nodes[succ]["deps_left"] -= 1
+                        if nodes[succ]["deps_left"] == 0:
+                            ready_by_engine[nodes[succ]["engine"]].append(succ)
+
+        const_slots = []
+        scalar_consts = {}
+
+        def scalar_const(val, name=None):
+            if val not in scalar_consts:
+                addr = self.alloc_scratch(name)
+                scalar_consts[val] = addr
+                const_slots.append(("const", addr, val))
+            return scalar_consts[val]
+
+        vec_consts = {}
+
+        def vector_const(val, name=None):
+            if val not in vec_consts:
+                vec_consts[val] = self.alloc_scratch(name or f"vconst_{val}", VLEN)
+            scalar_const(val)
+            return vec_consts[val]
+
+        one = scalar_const(1, "one")
+        vzero = self.alloc_scratch("vzero", VLEN)
+        vone = vector_const(1, "vone")
+        vtwo = vector_const(2, "vtwo")
+        for depth in range(3, forest_height + 1):
+            scalar_const(forest_values_p + (1 << depth) - 1)
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                vector_const(val1)
+                vector_const((1 << val3) + 1)
+            else:
+                scalar_const(val1)
+                scalar_const(val3)
+
+        value_addrs = [
+            scalar_const(inp_values_p + g * VLEN, f"value_addr_{g}") for g in range(n_vecs)
         ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        top_node_scalars = self.alloc_scratch("top_node_scalars", VLEN)
+        top_node_vecs = {}
+        for node_idx in range(15):
+            node_vec = self.alloc_scratch(f"vtop_node_{node_idx}", VLEN)
+            top_node_vecs[node_idx] = node_vec
+        top_setup_instrs = [{"load": [("vload", top_node_scalars, scalar_const(forest_values_p))]}]
+        first_broadcasts = [
+            ("vbroadcast", top_node_vecs[node_idx], top_node_scalars + node_idx)
+            for node_idx in range(7)
+        ]
+        for i in range(0, len(first_broadcasts), SLOT_LIMITS["valu"]):
+            top_setup_instrs.append({"valu": first_broadcasts[i : i + SLOT_LIMITS["valu"]]})
+        top_setup_instrs.append({"load": [("vload", top_node_scalars, scalar_const(forest_values_p + 7))]})
+        second_broadcasts = [
+            ("vbroadcast", top_node_vecs[node_idx], top_node_scalars + node_idx - 7)
+            for node_idx in range(7, 15)
+        ]
+        for i in range(0, len(second_broadcasts), SLOT_LIMITS["valu"]):
+            top_setup_instrs.append({"valu": second_broadcasts[i : i + SLOT_LIMITS["valu"]]})
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        vals = self.alloc_scratch("vals", batch_size)
+        path = self.alloc_scratch("path", batch_size)
+        hash_tmp = self.alloc_scratch("hash_tmp", batch_size)
+        node_tmp = self.alloc_scratch("node_tmp", batch_size)
+        sel_tmp = self.alloc_scratch("sel_tmp", batch_size)
 
-        body = []  # array of slots
+        emit_packed("load", const_slots)
+        emit_packed(
+            "valu",
+            [
+                ("vbroadcast", addr, scalar_consts[val])
+                for val, addr in vec_consts.items()
+                if val in scalar_consts
+            ],
+        )
+        self.instrs.extend(top_setup_instrs)
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        value_ready = []
+        path_ready = [[] for _ in range(n_vecs)]
+        set_component("setup")
+        for g in range(n_vecs):
+            value_ready.append(add_node("load", ("vload", vals + g * VLEN, value_addrs[g])))
+        d3_bit_tmp = top_node_scalars
+        d3_bit_tmp_last_user = None
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        scalar_hash_start_by_stage = {1: 0, 3: 0, 5: 0}
+        scalar_gather_start = 24
+        scalar_index_start = 26
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        for round_i in range(rounds):
+            depth = round_i % (forest_height + 1)
+            for g in range(n_vecs):
+                base = g * VLEN
+                deps = deps_list(value_ready[g]) + deps_list(path_ready[g])
+
+                set_component("gather")
+                if depth == 0:
+                    if g >= scalar_gather_start:
+                        gather_done = [
+                            add_node("alu", ("^", vals + base + lane, vals + base + lane, top_node_vecs[0] + lane), value_ready[g])
+                            for lane in range(VLEN)
+                        ]
+                    else:
+                        gather_done = add_node("valu", ("^", vals + base, vals + base, top_node_vecs[0]), value_ready[g])
+                elif depth == 1:
+                    cond = add_node("valu", ("==", hash_tmp + base, path + base, vone), deps)
+                    selected = add_node("flow", ("vselect", node_tmp + base, hash_tmp + base, top_node_vecs[2], top_node_vecs[1]), cond)
+                    gather_done = [
+                        add_node("alu", ("^", vals + base + lane, vals + base + lane, node_tmp + base + lane), deps_list(value_ready[g]) + [selected])
+                        for lane in range(VLEN)
+                    ] if g >= scalar_gather_start else add_node("valu", ("^", vals + base, vals + base, node_tmp + base), deps_list(value_ready[g]) + [selected])
+                elif depth == 2:
+                    bit0 = add_node("valu", ("&", hash_tmp + base, path + base, vone), deps)
+                    p0 = add_node("flow", ("vselect", node_tmp + base, hash_tmp + base, top_node_vecs[4], top_node_vecs[3]), bit0)
+                    p1 = add_node("flow", ("vselect", sel_tmp + base, hash_tmp + base, top_node_vecs[6], top_node_vecs[5]), bit0)
+                    shifted = add_node("valu", (">>", hash_tmp + base, path + base, vone), [p0, p1])
+                    bit1 = add_node("valu", ("&", hash_tmp + base, hash_tmp + base, vone), shifted)
+                    selected = add_node("flow", ("vselect", node_tmp + base, hash_tmp + base, sel_tmp + base, node_tmp + base), [bit1, p0, p1])
+                    gather_done = [
+                        add_node("alu", ("^", vals + base + lane, vals + base + lane, node_tmp + base + lane), deps_list(value_ready[g]) + [selected])
+                        for lane in range(VLEN)
+                    ] if g >= scalar_gather_start else add_node("valu", ("^", vals + base, vals + base, node_tmp + base), deps_list(value_ready[g]) + [selected])
+                elif depth == 3:
+                    bit0 = add_node("valu", ("&", hash_tmp + base, path + base, vone), deps)
+                    p0 = add_node("flow", ("vselect", node_tmp + base, hash_tmp + base, top_node_vecs[8], top_node_vecs[7]), bit0)
+                    p1 = add_node("flow", ("vselect", sel_tmp + base, hash_tmp + base, top_node_vecs[10], top_node_vecs[9]), bit0)
+                    shifted1 = add_node("valu", (">>", hash_tmp + base, path + base, vone), [p0, p1])
+                    bit1 = add_node("valu", ("&", hash_tmp + base, hash_tmp + base, vone), shifted1)
+                    q0 = add_node("flow", ("vselect", node_tmp + base, hash_tmp + base, sel_tmp + base, node_tmp + base), [bit1, p0, p1])
+                    bit0b = add_node("valu", ("&", hash_tmp + base, path + base, vone), q0)
+                    p2 = add_node("flow", ("vselect", sel_tmp + base, hash_tmp + base, top_node_vecs[12], top_node_vecs[11]), bit0b)
+                    p3 = add_node("flow", ("vselect", hash_tmp + base, hash_tmp + base, top_node_vecs[14], top_node_vecs[13]), [bit0b, p2])
+                    shifted1b = add_node("valu", (">>", hash_tmp + base, path + base, vone), [p2, p3])
+                    bit1b = add_node("valu", ("&", hash_tmp + base, hash_tmp + base, vone), shifted1b)
+                    q1 = add_node("flow", ("vselect", sel_tmp + base, hash_tmp + base, hash_tmp + base, sel_tmp + base), [bit1b, p2, p3])
+                    bit2 = add_node("valu", (">>", hash_tmp + base, path + base, vtwo), [q0, q1])
+                    selected = add_node("flow", ("vselect", node_tmp + base, hash_tmp + base, sel_tmp + base, node_tmp + base), [bit2, q0, q1])
+                    gather_done = [
+                        add_node("alu", ("^", vals + base + lane, vals + base + lane, node_tmp + base + lane), deps_list(value_ready[g]) + [selected])
+                        for lane in range(VLEN)
+                    ] if g >= scalar_gather_start else add_node("valu", ("^", vals + base, vals + base, node_tmp + base), deps_list(value_ready[g]) + [selected])
+                else:
+                    addr_const = scalar_consts[forest_values_p + (1 << depth) - 1]
+                    addr = [
+                        add_node("alu", ("+", hash_tmp + base + lane, path + base + lane, addr_const), deps)
+                        for lane in range(VLEN)
+                    ]
+                    loads = [
+                        add_node("load", ("load_offset", node_tmp + base, hash_tmp + base, lane), addr[lane])
+                        for lane in range(VLEN)
+                    ]
+                    gather_done = [
+                        add_node("alu", ("^", vals + base + lane, vals + base + lane, node_tmp + base + lane), [loads[lane]] + deps_list(value_ready[g]))
+                        for lane in range(VLEN)
+                    ] if g >= scalar_gather_start else add_node("valu", ("^", vals + base, vals + base, node_tmp + base), loads + deps_list(value_ready[g]))
+
+                cur_deps = deps_list(gather_done)
+                set_component("hash")
+                for stage_i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    if op1 == "+" and op2 == "+" and op3 == "<<":
+                        cur = add_node("valu", ("multiply_add", vals + base, vals + base, vec_consts[(1 << val3) + 1], vec_consts[val1]), cur_deps)
+                        cur_deps = [cur]
+                    elif g >= scalar_hash_start_by_stage.get(stage_i, n_vecs):
+                        next_deps = []
+                        for lane in range(VLEN):
+                            h1 = add_node("alu", (op1, hash_tmp + base + lane, vals + base + lane, scalar_consts[val1]), cur_deps)
+                            h2 = add_node("alu", (op3, vals + base + lane, vals + base + lane, scalar_consts[val3]), cur_deps)
+                            next_deps.append(add_node("alu", (op2, vals + base + lane, hash_tmp + base + lane, vals + base + lane), [h1, h2]))
+                        cur_deps = next_deps
+                    else:
+                        h1 = add_node("valu", (op1, hash_tmp + base, vals + base, vec_consts[val1]), cur_deps)
+                        h2 = add_node("valu", (op3, vals + base, vals + base, vec_consts[val3]), cur_deps)
+                        cur = add_node("valu", (op2, vals + base, hash_tmp + base, vals + base), [h1, h2])
+                        cur_deps = [cur]
+                value_ready[g] = cur_deps
+
+                if round_i == rounds - 1:
+                    continue
+                if depth == forest_height:
+                    path_ready[g] = []
+                    continue
+                set_component("index")
+                if depth == 0:
+                    if g >= scalar_index_start:
+                        path_ready[g] = [
+                            add_node("alu", ("&", path + base + lane, vals + base + lane, one), cur_deps)
+                            for lane in range(VLEN)
+                        ]
+                    else:
+                        path_ready[g] = add_node("valu", ("&", path + base, vals + base, vone), cur_deps)
+                else:
+                    if g >= scalar_index_start:
+                        next_path = []
+                        for lane in range(VLEN):
+                            parity = add_node("alu", ("&", hash_tmp + base + lane, vals + base + lane, one), cur_deps)
+                            doubled = add_node("alu", ("<<", path + base + lane, path + base + lane, one), deps_list(path_ready[g]) + [parity])
+                            next_path.append(add_node("alu", ("+", path + base + lane, path + base + lane, hash_tmp + base + lane), [doubled, parity]))
+                        path_ready[g] = next_path
+                    else:
+                        parity = add_node("valu", ("&", hash_tmp + base, vals + base, vone), cur_deps)
+                        path_ready[g] = add_node("valu", ("multiply_add", path + base, path + base, vtwo, hash_tmp + base), deps_list(path_ready[g]) + [parity])
+
+        set_component("store")
+        for g in range(n_vecs):
+            add_node("store", ("vstore", value_addrs[g], vals + g * VLEN), value_ready[g])
+
+        schedule_nodes()
 
 BASELINE = 147734
 
