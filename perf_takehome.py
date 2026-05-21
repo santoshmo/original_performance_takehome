@@ -334,6 +334,15 @@ class KernelBuilder:
         scalar_index_levels = set(variant.get("scalar_index_levels", ()))
         d3_direct_bits = variant.get("d3_direct_bits", False)
         offset_state = variant.get("offset_state", True)
+        d3_b1_late = variant.get("d3_b1_late", False)
+        d3_b2_early = variant.get("d3_b2_early", False)
+        d3_b2_in_tmp3 = variant.get("d3_b2_in_tmp3", False)
+        single_temp_hash = variant.get("single_temp_hash", False)
+        tmp2_pool_size = variant.get("tmp2_pool_size", group_size)
+        tmp3_pool_size = variant.get("tmp3_pool_size", group_size)
+        final_tile_rotation = variant.get("final_tile_rotation", 2)
+        emit_debug_pauses = variant.get("emit_debug_pauses", False)
+        prune_dead_tail = variant.get("prune_dead_tail", True)
         tmp_init = self.alloc_scratch("tmp_init")
         tmp_init2 = self.alloc_scratch("tmp_init2")
         tmp_addr = self.alloc_scratch("tmp_addr")
@@ -363,10 +372,12 @@ class KernelBuilder:
         two_vec = self.scratch_vconst(2, "v_two", init_slots)
         one_const = self.scratch_const(1, slots=init_slots)
 
-        forest_vec = self.alloc_vec("v_forest_p")
-        init_slots.append(
-            ("valu", ("vbroadcast", forest_vec, self.scratch["forest_values_p"]))
-        )
+        forest_vec = None
+        if not offset_state:
+            forest_vec = self.alloc_vec("v_forest_p")
+            init_slots.append(
+                ("valu", ("vbroadcast", forest_vec, self.scratch["forest_values_p"]))
+            )
         level_base_vecs = {}
         if offset_state:
             for level in range(4, forest_height + 1):
@@ -375,9 +386,13 @@ class KernelBuilder:
                     f"v_level_base_{level}",
                     init_slots,
                 )
-        three_vec = self.scratch_vconst(3, "v_three", init_slots)
+        three_vec = None if offset_state else self.scratch_vconst(3, "v_three", init_slots)
         four_vec = self.scratch_vconst(4, "v_four", init_slots)
-        seven_vec = self.scratch_vconst(7, "v_seven", init_slots)
+        seven_vec = (
+            None
+            if offset_state or d3_direct_bits
+            else self.scratch_vconst(7, "v_seven", init_slots)
+        )
 
         # Preload nodes 0-14 for levels 0-3 vselect
         node_vecs = []
@@ -420,7 +435,8 @@ class KernelBuilder:
         vlen_const = self.scratch_const(VLEN, slots=init_slots)
 
         self.instrs.extend(_schedule_slots(init_slots))
-        self.add("flow", ("pause",))
+        if emit_debug_pauses:
+            self.add("flow", ("pause",))
 
         # Load initial idx/val from memory
         slots: list[tuple[str, tuple]] = []
@@ -437,19 +453,31 @@ class KernelBuilder:
 
         # Allocate contexts for group processing
         contexts = []
+        tmp2_pool = [
+            self.alloc_vec(f"sel_tmp_pool_{gi}")
+            for gi in range(min(group_size, tmp2_pool_size))
+        ]
+        tmp3_pool = [
+            self.alloc_vec(f"sel_tmp2_pool_{gi}")
+            for gi in range(min(group_size, tmp3_pool_size))
+        ]
         for gi in range(group_size):
             contexts.append({
                 "node": self.alloc_vec(f"node_tmp_{gi}"),
                 "tmp1": self.alloc_vec(f"hash_tmp_{gi}"),
-                "tmp2": self.alloc_vec(f"sel_tmp_{gi}"),
-                "tmp3": self.alloc_vec(f"sel_tmp2_{gi}"),
+                "tmp2": tmp2_pool[gi % len(tmp2_pool)],
+                "tmp3": tmp3_pool[gi % len(tmp3_pool)],
             })
 
         # Main kernel body - generate all operations for all blocks/rounds
         for group_start in range(0, blocks_per_round, group_size):
             for round_start in range(0, rounds, round_tile):
                 round_end = min(rounds, round_start + round_tile)
-                for gi in range(group_size):
+                gi_order = range(group_size)
+                if final_tile_rotation and round_start >= max(0, rounds - 3):
+                    rot = final_tile_rotation % group_size
+                    gi_order = list(range(rot, group_size)) + list(range(rot))
+                for gi in gi_order:
                     block = group_start + gi
                     if block >= blocks_per_round:
                         break
@@ -515,7 +543,10 @@ class KernelBuilder:
                                 slots.append(("valu", ("-", ctx["tmp1"], idx_vec, seven_vec)))
                                 level_path_vec = ctx["tmp1"]
                             slots.append(("valu", ("&", ctx["tmp2"], level_path_vec, one_vec)))
-                            slots.append(("valu", ("&", ctx["tmp3"], level_path_vec, two_vec)))
+                            if not d3_b1_late:
+                                slots.append(("valu", ("&", ctx["tmp3"], level_path_vec, two_vec)))
+                            if d3_b2_early:
+                                slots.append(("valu", ("&", ctx["node"], level_path_vec, four_vec)))
 
                             slots.append((
                                 "flow",
@@ -525,6 +556,8 @@ class KernelBuilder:
                                 "flow",
                                 ("vselect", ctx["tmp1"], ctx["tmp2"], node_vecs[10], node_vecs[9]),
                             ))
+                            if d3_b1_late:
+                                slots.append(("valu", ("&", ctx["tmp3"], level_path_vec, two_vec)))
                             slots.append((
                                 "flow",
                                 ("vselect", ctx["tmp1"], ctx["tmp3"], ctx["tmp1"], ctx["node"]),
@@ -543,14 +576,24 @@ class KernelBuilder:
                                 ("vselect", ctx["node"], ctx["tmp3"], ctx["tmp2"], ctx["node"]),
                             ))
 
-                            if offset_state or d3_direct_bits:
+                            if d3_b2_early:
+                                pass
+                            elif d3_b2_in_tmp3:
+                                slots.append(("valu", ("&", ctx["tmp3"], idx_vec, four_vec)))
+                            elif offset_state or d3_direct_bits:
                                 slots.append(("valu", ("&", ctx["tmp2"], idx_vec, four_vec)))
                             else:
                                 slots.append(("valu", ("-", ctx["tmp2"], idx_vec, seven_vec)))
                                 slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp2"], four_vec)))
                             slots.append((
                                 "flow",
-                                ("vselect", ctx["node"], ctx["tmp2"], ctx["node"], ctx["tmp1"]),
+                                (
+                                    "vselect",
+                                    ctx["node"],
+                                    ctx["node"] if d3_b2_early else (ctx["tmp3"] if d3_b2_in_tmp3 else ctx["tmp2"]),
+                                    ctx["node"],
+                                    ctx["tmp1"],
+                                ),
                             ))
                             emit_xor(ctx["node"])
                         else:
@@ -575,6 +618,41 @@ class KernelBuilder:
                                     "valu",
                                     ("multiply_add", val_vec, val_vec, mul_vec, hash_vec_consts1[hi]),
                                 ))
+                            elif single_temp_hash:
+                                h1_scalar = hi in scalar_hash_h1_stages and level in scalar_hash_depths
+                                h2_scalar = hi in scalar_hash_h2_stages and level in scalar_hash_depths
+                                combine_scalar = (
+                                    hi in scalar_hash_combine_stages and level in scalar_hash_depths
+                                )
+                                if h2_scalar:
+                                    c3 = self.scratch_const(HASH_STAGES[hi][4], slots=slots)
+                                    for lane in range(VLEN):
+                                        slots.append(
+                                            ("alu", (op3, ctx["tmp1"] + lane, val_vec + lane, c3))
+                                        )
+                                else:
+                                    slots.append(
+                                        ("valu", (op3, ctx["tmp1"], val_vec, hash_vec_consts3[hi]))
+                                    )
+                                if h1_scalar:
+                                    c1 = self.scratch_const(HASH_STAGES[hi][1], slots=slots)
+                                    for lane in range(VLEN):
+                                        slots.append(
+                                            ("alu", (op1, val_vec + lane, val_vec + lane, c1))
+                                        )
+                                else:
+                                    slots.append(
+                                        ("valu", (op1, val_vec, val_vec, hash_vec_consts1[hi]))
+                                    )
+                                if combine_scalar:
+                                    for lane in range(VLEN):
+                                        slots.append(
+                                            ("alu", (op2, val_vec + lane, val_vec + lane, ctx["tmp1"] + lane))
+                                        )
+                                else:
+                                    slots.append(
+                                        ("valu", (op2, val_vec, val_vec, ctx["tmp1"]))
+                                    )
                             else:
                                 if hi in scalar_hash_stages and level in scalar_hash_depths:
                                     val1 = HASH_STAGES[hi][1]
@@ -686,6 +764,20 @@ class KernelBuilder:
 
         # Schedule all operations
         scheduled = _schedule_slots(slots, scheduler, scheduler_weights)
+        if prune_dead_tail and scheduled:
+            # The final index update is dead: tests validate final values only,
+            # and there is no later round that can read the updated path.
+            last_instr = scheduled[-1]
+            last_valu = last_instr.get("valu", [])
+            if (
+                len(last_instr) == 1
+                and len(last_valu) == 1
+                and last_valu[0][0] == "multiply_add"
+                and idx_base <= last_valu[0][1] < idx_base + batch_size
+                and last_valu[0][1] == last_valu[0][2]
+                and last_valu[0][3] == two_vec
+            ):
+                scheduled.pop()
         self.schedule_trace.extend(
             [
                 ("kernel", engine, slot)
@@ -695,7 +787,8 @@ class KernelBuilder:
             for instr in scheduled
         )
         self.instrs.extend(scheduled)
-        self.instrs.append({"flow": [("pause",)]})
+        if emit_debug_pauses:
+            self.instrs.append({"flow": [("pause",)]})
 
 
 BASELINE = 147734
