@@ -1102,16 +1102,16 @@ class KernelBuilder:
             variant.get("final_scalar_hash_combine_stages", scalar_hash_combine_stages)
         )
         predrain_scalar_hash_h1_stages = set(
-            variant.get("predrain_scalar_hash_h1_stages", (3,))
+            variant.get("predrain_scalar_hash_h1_stages", (1,))
         )
         predrain_scalar_hash_h2_stages = set(
-            variant.get("predrain_scalar_hash_h2_stages", ())
+            variant.get("predrain_scalar_hash_h2_stages", (5,))
         )
         predrain_scalar_hash_combine_stages = set(
-            variant.get("predrain_scalar_hash_combine_stages", (1, 5))
+            variant.get("predrain_scalar_hash_combine_stages", (1,))
         )
         default_hash_scalar_by_round = {
-            5: {"h1": (3,), "h2": (3,), "combine": ()},
+            5: {"h1": (), "h2": (1,), "combine": ()},
         }
         simd_hash_scalar_by_round = {
             int(round_i): {
@@ -1143,7 +1143,7 @@ class KernelBuilder:
         }
         simd_predrain_group_order = variant.get("simd_predrain_group_order", "rotate")
         simd_predrain_group_sequence = variant.get("simd_predrain_group_sequence")
-        simd_predrain_group_rotation = variant.get("simd_predrain_group_rotation", 1)
+        simd_predrain_group_rotation = variant.get("simd_predrain_group_rotation", 6)
         simd_predrain_hash_rounds = {
             int(round_i) for round_i in variant.get("simd_predrain_hash_rounds", (13,))
         }
@@ -1156,9 +1156,22 @@ class KernelBuilder:
         simd_drop_final_index = variant.get("simd_drop_final_index", True)
         simd_final_wavefront = variant.get("simd_final_wavefront", False)
         simd_interleave_final_stores = variant.get("simd_interleave_final_stores", False)
+        simd_prefetch_final_node_into_idx = variant.get(
+            "simd_prefetch_final_node_into_idx", True
+        )
+        simd_pair_stream_node_setup = variant.get("simd_pair_stream_node_setup", True)
         prune_dead_tail = variant.get("prune_dead_tail", True)
         ir_scheduler = variant.get("ir_scheduler", "asap")
-        ir_scheduler_weights = variant.get("ir_scheduler_weights", {})
+        ir_scheduler_weights = variant.get(
+            "ir_scheduler_weights",
+            {
+                "tail_reschedule_window": 25,
+                "tail_rounds": 1,
+                "final_store_bonus": 40,
+                "final_hash_bonus": 0,
+                "droppable_penalty": 40,
+            },
+        )
         region_local_compact_scratch = variant.get("region_local_compact_scratch", False)
         region_local_compact_pools = {
             str(pool) for pool in variant.get("region_local_compact_pools", ("context",))
@@ -1190,8 +1203,24 @@ class KernelBuilder:
 
         init_slots: list[tuple[str, tuple]] = [
             ("load", ("const", self.scratch["forest_values_p"], forest_values_p)),
-            ("load", ("const", self.scratch["inp_indices_p"], inp_indices_p)),
-            ("load", ("const", self.scratch["inp_values_p"], inp_values_p)),
+            (
+                "flow",
+                (
+                    "add_imm",
+                    self.scratch["inp_indices_p"],
+                    self.scratch["forest_values_p"],
+                    inp_indices_p - forest_values_p,
+                ),
+            ),
+            (
+                "flow",
+                (
+                    "add_imm",
+                    self.scratch["inp_values_p"],
+                    self.scratch["forest_values_p"],
+                    inp_values_p - forest_values_p,
+                ),
+            ),
         ]
         scalar_consts: dict[int, int] = {}
         vconsts: dict[int, int] = {}
@@ -1221,31 +1250,90 @@ class KernelBuilder:
                 init_slots.append(("valu", ("vbroadcast", addr, scalar)))
             return vconsts[value]
 
-        zero_vec = vector_const(0, "v_zero")
-        one_vec = vector_const(1, "v_one")
-        two_vec = vector_const(2, "v_two")
+        def derived_scalar_const(
+            value: int,
+            name: str,
+            op: str,
+            left: int,
+            right: int,
+        ) -> int:
+            if value in scalar_consts:
+                return scalar_consts[value]
+            addr = self.alloc_scratch(
+                name,
+                role="const",
+                pool="const",
+                persistent=True,
+            )
+            scalar_consts[value] = addr
+            init_slots.append(("alu", (op, addr, left, right)))
+            return addr
+
         one_const = scalar_const(1, "one")
+        one_vec = vector_const(1, "v_one")
+        two_const = derived_scalar_const(2, "two", "+", one_const, one_const)
+        three_const = derived_scalar_const(3, "three", "+", one_const, two_const)
+        two_vec = vector_const(2, "v_two")
+        four_const = derived_scalar_const(4, "four", "+", two_const, two_const)
+        five_const = derived_scalar_const(5, "five", "+", four_const, one_const)
+        nine_const = derived_scalar_const(9, "nine", "+", five_const, four_const)
+        sixteen_const = derived_scalar_const(16, "sixteen", "*", four_const, four_const)
+        thirty_two_const = derived_scalar_const(32, "thirty_two", "+", sixteen_const, sixteen_const)
+        thirty_three_const = derived_scalar_const(33, "thirty_three", "+", thirty_two_const, one_const)
+        twelve_const = derived_scalar_const(12, "twelve", "*", three_const, four_const)
+        nineteen_const = derived_scalar_const(19, "nineteen", "+", sixteen_const, three_const)
+        four_k_const = derived_scalar_const(4096, "four_k", "<<", one_const, twelve_const)
+        derived_scalar_const(4097, "four_k_plus_one", "+", four_k_const, one_const)
+        four_vec = vector_const(4, "v_four")
+        twenty_two_const = derived_scalar_const(22, "twenty_two", "+", nineteen_const, three_const)
+        thirty_eight_const = derived_scalar_const(38, "thirty_eight", "+", thirty_three_const, five_const)
+        sixty_four_const = derived_scalar_const(64, "sixty_four", "+", thirty_two_const, thirty_two_const)
+        one_twenty_eight_const = derived_scalar_const(128, "one_twenty_eight", "+", sixty_four_const, sixty_four_const)
+        two_fifty_six_const = derived_scalar_const(256, "two_fifty_six", "+", one_twenty_eight_const, one_twenty_eight_const)
+        five_twelve_const = derived_scalar_const(512, "five_twelve", "+", two_fifty_six_const, two_fifty_six_const)
+        seventy_const = derived_scalar_const(70, "seventy", "+", thirty_eight_const, thirty_two_const)
+        one_thirty_four_const = derived_scalar_const(134, "one_thirty_four", "+", seventy_const, sixty_four_const)
+        two_sixty_two_const = derived_scalar_const(262, "two_sixty_two", "+", one_thirty_four_const, one_twenty_eight_const)
+        five_eighteen_const = derived_scalar_const(518, "five_eighteen", "+", two_sixty_two_const, two_fifty_six_const)
+        derived_scalar_const(1030, "ten_thirty", "+", five_eighteen_const, five_twelve_const)
         level_base_vecs = {
             level: vector_const(forest_values_p + (1 << level) - 1, f"v_level_base_{level}")
             for level in range(4, forest_height + 1)
         }
-        four_vec = vector_const(4, "v_four")
 
+        node_scalars = [
+            self.alloc_role(f"node_{node_idx}", "node_cache", persistent=True)
+            for node_idx in range(15)
+        ]
         node_vecs = []
-        for node_idx in range(15):
-            node_scalar = self.alloc_role(f"node_{node_idx}", "node_cache", persistent=True)
+        for node_idx, node_scalar in enumerate(node_scalars):
             node_vec = self.alloc_vec(
                 f"v_node_{node_idx}",
                 "node_cache",
                 pool="top_nodes",
                 persistent=True,
             )
-            node_offset = scalar_const(node_idx)
-            addr_reg = tmp_init if node_idx % 2 == 0 else tmp_init2
-            init_slots.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], node_offset)))
-            init_slots.append(("load", ("load", node_scalar, addr_reg)))
-            init_slots.append(("valu", ("vbroadcast", node_vec, node_scalar)))
             node_vecs.append(node_vec)
+        if simd_pair_stream_node_setup:
+            init_slots.append(("flow", ("add_imm", tmp_init, self.scratch["forest_values_p"], 0)))
+            init_slots.append(("alu", ("+", tmp_init2, self.scratch["forest_values_p"], one_const)))
+            for node_idx in range(0, 15, 2):
+                init_slots.append(("load", ("load", node_scalars[node_idx], tmp_init)))
+                init_slots.append(("valu", ("vbroadcast", node_vecs[node_idx], node_scalars[node_idx])))
+                if node_idx + 1 < 15:
+                    init_slots.append(("load", ("load", node_scalars[node_idx + 1], tmp_init2)))
+                    init_slots.append(("valu", ("vbroadcast", node_vecs[node_idx + 1], node_scalars[node_idx + 1])))
+                if node_idx + 2 < 15:
+                    init_slots.append(("alu", ("+", tmp_init, tmp_init, two_const)))
+                if node_idx + 3 < 15:
+                    init_slots.append(("alu", ("+", tmp_init2, tmp_init2, two_const)))
+        else:
+            for node_idx, node_scalar in enumerate(node_scalars):
+                node_offset = scalar_const(node_idx)
+                addr_reg = tmp_init if node_idx % 2 == 0 else tmp_init2
+                init_slots.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], node_offset)))
+                init_slots.append(("load", ("load", node_scalar, addr_reg)))
+                init_slots.append(("valu", ("vbroadcast", node_vecs[node_idx], node_scalar)))
 
         hash_vec_consts1 = []
         hash_vec_consts3 = []
@@ -1262,8 +1350,14 @@ class KernelBuilder:
         val_base = self.alloc_role("vals", "value", batch_size, pool="batch_state", persistent=True)
 
         offset = self.alloc_role("offset", "addr_tmp", pool="io")
-        init_slots.append(("load", ("const", offset, 0)))
-        vlen_const = scalar_const(VLEN, "vlen")
+        init_slots.append(("flow", ("add_imm", offset, self.scratch["forest_values_p"], -forest_values_p)))
+        vlen_const = self.alloc_scratch(
+            "vlen",
+            role="const",
+            pool="const",
+            persistent=True,
+        )
+        init_slots.append(("alu", ("+", vlen_const, four_const, four_const)))
         blocks_per_round = batch_size // VLEN
         final_store_offsets = (
             [
@@ -1359,6 +1453,7 @@ class KernelBuilder:
             for engine, slot in load_slots
         ]
         interleaved_store_blocks: set[int] = set()
+        deferred_final_prefetch_ops: list[KernelOp] = []
 
         def emit_simd_op(
             engine: str,
@@ -1530,6 +1625,13 @@ class KernelBuilder:
                 yield group_start, final_start, rounds, True
 
         for group_start, round_start, round_end, is_final_drain in tile_plan():
+                if (
+                    simd_prefetch_final_node_into_idx
+                    and is_final_drain
+                    and deferred_final_prefetch_ops
+                ):
+                    body_ops.extend(deferred_final_prefetch_ops)
+                    deferred_final_prefetch_ops = []
                 if (
                     simd_final_wavefront
                     and is_final_drain
@@ -1795,12 +1897,15 @@ class KernelBuilder:
                             add("flow", ("vselect", ctx["node"], high_bit, ctx["node"], ctx["tmp1"]), "select")
                             emit_xor(ctx["node"])
                         else:
-                            addr_base_vec = level_base_vecs[level]
-                            for lane in range(VLEN):
-                                add("alu", ("+", ctx["tmp1"] + lane, addr_base_vec + lane, idx_vec + lane), "gather")
-                            for lane in range(VLEN):
-                                add("load", ("load", ctx["node"] + lane, ctx["tmp1"] + lane), "gather")
-                            emit_xor(ctx["node"])
+                            if simd_prefetch_final_node_into_idx and round_i == rounds - 1:
+                                emit_xor(idx_vec)
+                            else:
+                                addr_base_vec = level_base_vecs[level]
+                                for lane in range(VLEN):
+                                    add("alu", ("+", ctx["tmp1"] + lane, addr_base_vec + lane, idx_vec + lane), "gather")
+                                for lane in range(VLEN):
+                                    add("load", ("load", ctx["node"] + lane, ctx["tmp1"] + lane), "gather")
+                                emit_xor(ctx["node"])
 
                         for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
                             mul_vec = hash_mul_vecs[hi]
@@ -1838,7 +1943,7 @@ class KernelBuilder:
                         if simd_drop_final_index and round_i == rounds - 1:
                             pass
                         elif level == forest_height:
-                            add("valu", ("+", idx_vec, zero_vec, zero_vec), "index")
+                            add("valu", ("^", idx_vec, idx_vec, idx_vec), "index")
                         else:
                             parity_vec = (
                                 ctx[f"selector{round_i % simd_selector_ring_depth}"]
@@ -1853,6 +1958,41 @@ class KernelBuilder:
                                     add("alu", ("+", idx_vec + lane, idx_vec + lane, parity_vec + lane), "index")
                             else:
                                 add("valu", ("multiply_add", idx_vec, idx_vec, two_vec, parity_vec), "index")
+
+                        if (
+                            simd_prefetch_final_node_into_idx
+                            and simd_drop_final_index
+                            and round_i == rounds - 2
+                        ):
+                            final_level = (round_i + 1) % (forest_height + 1)
+                            if final_level >= 4:
+                                addr_base_vec = level_base_vecs[final_level]
+                                for lane in range(VLEN):
+                                    deferred_final_prefetch_ops.append(
+                                        self.make_ir_op(
+                                            "alu",
+                                            ("+", idx_vec + lane, addr_base_vec + lane, idx_vec + lane),
+                                            tag="gather",
+                                            round=rounds - 1,
+                                            level=final_level,
+                                            group=block,
+                                            contributes_value=True,
+                                            region="final_drain",
+                                        )
+                                    )
+                                for lane in range(VLEN):
+                                    deferred_final_prefetch_ops.append(
+                                        self.make_ir_op(
+                                            "load",
+                                            ("load", idx_vec + lane, idx_vec + lane),
+                                            tag="gather",
+                                            round=rounds - 1,
+                                            level=final_level,
+                                            group=block,
+                                            contributes_value=True,
+                                            region="final_drain",
+                                        )
+                                    )
 
                         if simd_interleave_final_stores and round_i == rounds - 1:
                             emit_simd_op(
